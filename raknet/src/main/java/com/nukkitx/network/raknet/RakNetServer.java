@@ -154,9 +154,9 @@ public class RakNetServer extends RakNet {
 
         if (session != null) {
             this.sendAlreadyConnected(ctx, packet.sender());
-        } else if (this.protocolVersion >= 0 && this.protocolVersion != protocolVersion) {
+        /*} else if (this.protocolVersion >= 0 && this.protocolVersion != protocolVersion) {
             this.sendIncompatibleProtocolVersion(ctx, packet.sender());
-        } else if (this.maxConnections >= 0 && this.maxConnections <= getSessionCount()) {
+        */} else if (this.maxConnections >= 0 && this.maxConnections <= getSessionCount()) {
             this.sendNoFreeIncomingConnections(ctx, packet.sender());
         } else if (this.listener != null && !this.listener.onConnectionRequest(packet.sender())) {
             this.sendConnectionBanned(ctx, packet.sender());
