@@ -49,6 +49,7 @@ public abstract class RakNetSession implements SessionConnection<ByteBuf> {
     final InetSocketAddress address;
     private final Channel channel;
     private final ChannelPromise voidPromise;
+    final int protocolVersion;
     final EventLoop eventLoop;
     private int mtu;
     private int adjustedMtu; // Used in datagram calculations
@@ -93,10 +94,11 @@ public abstract class RakNetSession implements SessionConnection<ByteBuf> {
     private volatile int unackedBytes;
     private volatile long lastMinWeight;
 
-    RakNetSession(InetSocketAddress address, Channel channel, int mtu, EventLoop eventLoop) {
+    RakNetSession(InetSocketAddress address, Channel channel, int mtu, int protocolVersion, EventLoop eventLoop) {
         this.address = address;
         this.channel = channel;
         this.setMtu(mtu);
+        this.protocolVersion = protocolVersion;
         this.eventLoop = eventLoop;
         // We can reuse this instead of creating a new one each time
         this.voidPromise = channel.voidPromise();
@@ -190,6 +192,10 @@ public abstract class RakNetSession implements SessionConnection<ByteBuf> {
     void setMtu(int mtu) {
         this.mtu = RakNetUtils.clamp(mtu, MINIMUM_MTU_SIZE, MAXIMUM_MTU_SIZE);
         this.adjustedMtu = (this.mtu - UDP_HEADER_SIZE) - (this.address.getAddress() instanceof Inet6Address ? 40 : 20);
+    }
+
+    public int getProtocolVersion() {
+        return protocolVersion;
     }
 
     public long getPing() {
@@ -457,7 +463,7 @@ public abstract class RakNetSession implements SessionConnection<ByteBuf> {
     }
 
     protected void tick(long curTime) {
-        if (this.isTimedOut()) {
+        if (this.isTimedOut(curTime)) {
             this.close(DisconnectReason.TIMED_OUT);
             return;
         }
@@ -492,12 +498,12 @@ public abstract class RakNetSession implements SessionConnection<ByteBuf> {
             IntRange range;
             while ((range = this.incomingNaks.poll()) != null) {
                 for (int i = range.start; i <= range.end; i++) {
-                    RakNetDatagram datagram = this.sentDatagrams.get(i);
+                    RakNetDatagram datagram = this.sentDatagrams.remove(i);
                     if (datagram != null) {
                         if (log.isTraceEnabled()) {
                             log.trace("NAK'ed datagram {} from {}", datagram.sequenceIndex, this.address);
                         }
-                        this.sendDatagram(datagram.retain(), curTime, false);
+                        this.sendDatagram(datagram, curTime);
                     }
                 }
             }
@@ -549,7 +555,7 @@ public abstract class RakNetSession implements SessionConnection<ByteBuf> {
                         log.trace("Stale datagram {} from {}", datagram.sequenceIndex,
                                 this.address);
                     }
-                    this.sendDatagram(datagram.retain(), curTime, false);
+                    this.sendDatagram(datagram, curTime);
                 }
             }
 
@@ -578,7 +584,7 @@ public abstract class RakNetSession implements SessionConnection<ByteBuf> {
 
                     if (!datagram.tryAddPacket(packet, this.adjustedMtu)) {
                         // Send full datagram
-                        this.sendDatagram(datagram, curTime, true);
+                        this.sendDatagram(datagram, curTime);
 
                         datagram = new RakNetDatagram(curTime);
 
@@ -589,7 +595,7 @@ public abstract class RakNetSession implements SessionConnection<ByteBuf> {
                 }
 
                 if (!datagram.packets.isEmpty()) {
-                    this.sendDatagram(datagram, curTime, true);
+                    this.sendDatagram(datagram, curTime);
                 }
             }
         } finally {
@@ -707,7 +713,7 @@ public abstract class RakNetSession implements SessionConnection<ByteBuf> {
                 throw new IllegalArgumentException("Packet too large to fit in MTU (size: " + packet.getSize() +
                         ", MTU: " + this.adjustedMtu + ")");
             }
-            this.sendDatagram(datagram, curTime, true);
+            this.sendDatagram(datagram, curTime);
         }
         this.channel.flush();
     }
@@ -787,21 +793,23 @@ public abstract class RakNetSession implements SessionConnection<ByteBuf> {
         return packets;
     }
 
-    private void sendDatagram(RakNetDatagram datagram, long time, boolean firstSend) {
+    private void sendDatagram(RakNetDatagram datagram, long time) {
         Preconditions.checkArgument(!datagram.packets.isEmpty(), "RakNetDatagram with no packets");
         try {
-            if (datagram.sequenceIndex == -1) {
-                datagram.sequenceIndex = datagramWriteIndexUpdater.getAndIncrement(this);
-            }
+            int oldIndex = datagram.sequenceIndex;
+            datagram.sequenceIndex = datagramWriteIndexUpdater.getAndIncrement(this);
+
             for (EncapsulatedPacket packet : datagram.packets) {
                 // check if packet is reliable so it can be resent later if a NAK is received.
                 if (packet.reliability != RakNetReliability.UNRELIABLE &&
                         packet.reliability != RakNetReliability.UNRELIABLE_SEQUENCED) {
                     datagram.nextSend = time + this.slidingWindow.getRtoForRetransmission();
-                    if (firstSend) {
-                        this.sentDatagrams.put(datagram.sequenceIndex, datagram.retain());
+                    if (oldIndex == -1) {
                         unackedBytesUpdater.addAndGet(this, datagram.getSize());
+                    } else {
+                        this.sentDatagrams.remove(oldIndex, datagram);
                     }
+                    this.sentDatagrams.put(datagram.sequenceIndex, datagram.retain()); // Keep for resending
                     break;
                 }
             }
@@ -907,14 +915,23 @@ public abstract class RakNetSession implements SessionConnection<ByteBuf> {
         this.lastTouched = System.currentTimeMillis();
     }
 
+    public boolean isStale(long curTime) {
+        return curTime - this.lastTouched >= SESSION_STALE_MS;
+    }
+    
     public boolean isStale() {
-        return System.currentTimeMillis() - this.lastTouched >= SESSION_STALE_MS;
+        return isStale(System.currentTimeMillis());
+    }
+
+    public boolean isTimedOut(long curTime) {
+        return curTime - this.lastTouched >= SESSION_TIMEOUT_MS;
     }
 
     public boolean isTimedOut() {
-        return System.currentTimeMillis() - this.lastTouched >= SESSION_TIMEOUT_MS;
+        return isTimedOut(System.currentTimeMillis());
     }
 
+    
     private void checkForClosed() {
         Preconditions.checkState(!this.closed, "Session already closed");
     }
