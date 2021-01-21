@@ -4,17 +4,17 @@ import com.nukkitx.network.util.EventLoops;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.*;
 import io.netty.channel.socket.DatagramPacket;
+import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 import lombok.RequiredArgsConstructor;
 
 import javax.annotation.ParametersAreNonnullByDefault;
 import java.net.InetSocketAddress;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.Map;
-import java.util.Objects;
-import java.util.concurrent.*;
+import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.Consumer;
 
 import static com.nukkitx.network.raknet.RakNetConstants.*;
@@ -23,7 +23,8 @@ import static com.nukkitx.network.raknet.RakNetConstants.*;
 public class RakNetClient extends RakNet {
     private static final InternalLogger log = InternalLoggerFactory.getInstance(RakNetClient.class);
     private final ClientDatagramHandler handler = new ClientDatagramHandler();
-    private final ConcurrentMap<InetSocketAddress, PingEntry> pings = new ConcurrentHashMap<>();
+    private final Queue<PongEntry> inboundPongs = PlatformDependent.newMpscQueue();
+    private final Map<InetSocketAddress, PingEntry> pings = new HashMap<>();
     private final Map<String, Consumer<Throwable>> exceptionHandlers = new HashMap<>();
 
     RakNetClientSession session;
@@ -60,7 +61,8 @@ public class RakNetClient extends RakNet {
             throw new IllegalStateException("Session has already been created");
         }
 
-        this.session = new RakNetClientSession(this, address, this.channel, MAXIMUM_MTU_SIZE, this.protocolVersion);
+        this.session = new RakNetClientSession(this, address, this.channel, this.channel.eventLoop(),
+                MAXIMUM_MTU_SIZE, this.protocolVersion);
         return this.session;
     }
 
@@ -102,13 +104,21 @@ public class RakNetClient extends RakNet {
     @Override
     protected void onTick() {
         final long curTime = System.currentTimeMillis();
-        if (this.session != null) {
-            if (this.session.isClosed()) {
-                this.session = null;
-            } else {
-                this.session.channel.eventLoop().execute(() -> session.onTick(curTime));
-            }
+        final RakNetClientSession session = this.session;
+        if (session != null && !session.isClosed()) {
+            session.eventLoop.execute(() -> session.onTick(curTime));
         }
+
+        PongEntry pong;
+        while ((pong = this.inboundPongs.poll()) != null) {
+            PingEntry ping = this.pings.remove(pong.address);
+            if (ping == null) {
+                continue;
+            }
+
+            ping.future.complete(new RakNetPong(pong.pingTime, curTime, pong.guid, pong.userData));
+        }
+
         Iterator<PingEntry> iterator = this.pings.values().iterator();
         while (iterator.hasNext()) {
             PingEntry entry = iterator.next();
@@ -119,12 +129,16 @@ public class RakNetClient extends RakNet {
         }
     }
 
-    private void onUnconnectedPong(DatagramPacket packet) {
-        PingEntry entry = this.pings.get(packet.sender());
-        if (entry == null) {
-            return;
-        }
+    @Override
+    public void close() {
+        super.close();
 
+        if (channel != null) {
+            channel.close().syncUninterruptibly();
+        }
+    }
+
+    private void onUnconnectedPong(DatagramPacket packet) {
         ByteBuf content = packet.content();
         long pingTime = content.readLong();
         long guid = content.readLong();
@@ -138,7 +152,7 @@ public class RakNetClient extends RakNet {
             content.readBytes(userData);
         }
 
-        entry.future.complete(new RakNetPong(pingTime, System.currentTimeMillis(), guid, userData));
+        this.inboundPongs.offer(new PongEntry(packet.sender(), pingTime, guid, userData));
     }
 
     private void sendUnconnectedPing(InetSocketAddress recipient) {
@@ -157,6 +171,14 @@ public class RakNetClient extends RakNet {
         private final long timeout;
     }
 
+    @RequiredArgsConstructor
+    private static class PongEntry {
+        private final InetSocketAddress address;
+        private final long pingTime;
+        private final long guid;
+        private final byte[] userData;
+    }
+
     private class ClientDatagramHandler extends ChannelInboundHandlerAdapter {
 
         @Override
@@ -172,9 +194,13 @@ public class RakNetClient extends RakNet {
 
                 if (packetId == ID_UNCONNECTED_PONG) {
                     RakNetClient.this.onUnconnectedPong(packet);
-                } else if (session != null) {
+                } else if (session != null && session.address.equals(packet.sender())) {
                     content.readerIndex(0);
-                    session.onDatagram(packet);
+                    if (session.eventLoop.inEventLoop()) {
+                        session.onDatagram(content);
+                    } else {
+                        session.eventLoop.execute(() -> session.onDatagram(content));
+                    }
                 }
             } finally {
                 packet.release();

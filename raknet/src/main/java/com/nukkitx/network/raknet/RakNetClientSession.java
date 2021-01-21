@@ -4,6 +4,7 @@ import com.nukkitx.network.NetworkUtils;
 import com.nukkitx.network.util.DisconnectReason;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
+import io.netty.channel.EventLoop;
 
 import javax.annotation.ParametersAreNonnullByDefault;
 import java.net.Inet6Address;
@@ -17,8 +18,9 @@ public class RakNetClientSession extends RakNetSession {
     private int connectionAttempts;
     private long nextConnectionAttempt;
 
-    RakNetClientSession(RakNetClient rakNet, InetSocketAddress address, Channel channel, int mtu, int protocolVersion) {
-        super(address, channel, mtu, protocolVersion);
+    RakNetClientSession(RakNetClient rakNet, InetSocketAddress address, Channel channel, EventLoop eventLoop, int mtu,
+                        int protocolVersion) {
+        super(address, channel, eventLoop, mtu, protocolVersion);
         this.rakNet = rakNet;
     }
 
@@ -137,12 +139,17 @@ public class RakNetClientSession extends RakNetSession {
     private void onConnectionRequestAccepted(ByteBuf buffer) {
         NetworkUtils.readAddress(buffer); // our address
         buffer.readUnsignedShort(); // system index
-        final int required = (this.address.getAddress() instanceof Inet6Address ? IPV6_MESSAGE_SIZE : IPV4_MESSAGE_SIZE) + 16;
-        while (buffer.isReadable(required)) {
-            NetworkUtils.readAddress(buffer);
+        final int required = IPV4_MESSAGE_SIZE + 16; // Address + 2 * Long - Minimum amount of data
+        long pongTime = 0;
+        try {
+            while (buffer.isReadable(required)) {
+                NetworkUtils.readAddress(buffer);
+            }
+            pongTime = buffer.readLong();
+            buffer.readLong();
+        } catch (IndexOutOfBoundsException ignored) {
+            // Hive sends malformed IPv6 address
         }
-        long pongTime = buffer.readLong();
-        buffer.readLong();
 
         this.sendNewIncomingConnection(pongTime);
 
