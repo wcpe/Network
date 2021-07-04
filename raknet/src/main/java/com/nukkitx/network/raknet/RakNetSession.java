@@ -143,6 +143,7 @@ public abstract class RakNetSession implements SessionConnection<ByteBuf> {
                 packet.release();
             }
         }
+        if (this.outgoingPacketNextWeights == null) this.outgoingPacketNextWeights = new long[4];
         this.initHeapWeights();
     }
 
