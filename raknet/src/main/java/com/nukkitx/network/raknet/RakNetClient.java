@@ -199,7 +199,15 @@ public class RakNetClient extends RakNet {
                     if (session.eventLoop.inEventLoop()) {
                         session.onDatagram(content);
                     } else {
-                        session.eventLoop.execute(() -> session.onDatagram(content));
+//                        session.eventLoop.execute(() -> session.onDatagram(content));
+                        ByteBuf copy = content.copy();
+                        session.eventLoop.execute(() -> {
+                            try {
+                                session.onDatagram(copy);
+                            } finally {
+                                copy.release();
+                            }
+                        });
                     }
                 }
             } finally {
