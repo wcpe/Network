@@ -23,17 +23,15 @@ import java.net.InetSocketAddress;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ConcurrentSkipListMap;
-import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 
 import static com.nukkitx.network.raknet.RakNetConstants.*;
 
 @ParametersAreNonnullByDefault
 public abstract class RakNetSession implements SessionConnection<ByteBuf> {
     private static final InternalLogger log = InternalLoggerFactory.getInstance(RakNetSession.class);
-    static final AtomicIntegerFieldUpdater<RakNetSession> closedUpdater =
-            AtomicIntegerFieldUpdater.newUpdater(RakNetSession.class, "closed");
 
     final InetSocketAddress address;
+    InetSocketAddress proxiedAddress = null;
     final Channel channel;
     final EventLoop eventLoop;
     final int protocolVersion;
@@ -42,7 +40,7 @@ public abstract class RakNetSession implements SessionConnection<ByteBuf> {
     long guid;
     private volatile RakNetState state = RakNetState.UNCONNECTED;
     private volatile long lastTouched = System.currentTimeMillis();
-    volatile int closed = 0;
+    private volatile boolean closed = false;
 
     // Reliability, Ordering, Sequencing and datagram indexes
     private RakNetSlidingWindow slidingWindow;
@@ -53,8 +51,8 @@ public abstract class RakNetSession implements SessionConnection<ByteBuf> {
     private int reliabilityWriteIndex;
     private int[] orderReadIndex;
     private int[] orderWriteIndex;
-    private int[] sequenceReadIndex;
-    private int[] sequenceWriteIndex;
+    // private int[] sequenceReadIndex;
+    // private int[] sequenceWriteIndex;
 
     private RoundRobinArray<SplitPacketHelper> splitPackets;
     private BitQueue reliableDatagramQueue;
@@ -93,8 +91,8 @@ public abstract class RakNetSession implements SessionConnection<ByteBuf> {
         this.reliableDatagramQueue = new BitQueue(512);
         this.orderReadIndex = new int[MAXIMUM_ORDERING_CHANNELS];
         this.orderWriteIndex = new int[MAXIMUM_ORDERING_CHANNELS];
-        this.sequenceReadIndex = new int[MAXIMUM_ORDERING_CHANNELS];
-        this.sequenceWriteIndex = new int[MAXIMUM_ORDERING_CHANNELS];
+        // this.sequenceReadIndex = new int[MAXIMUM_ORDERING_CHANNELS];
+        // this.sequenceWriteIndex = new int[MAXIMUM_ORDERING_CHANNELS];
 
         //noinspection unchecked
         this.orderingHeaps = new FastBinaryMinHeap[MAXIMUM_ORDERING_CHANNELS];
@@ -143,11 +141,16 @@ public abstract class RakNetSession implements SessionConnection<ByteBuf> {
                 packet.release();
             }
         }
-        this.initHeapWeights();
     }
 
     public InetSocketAddress getAddress() {
         return this.address;
+    }
+
+    @Override
+    public InetSocketAddress getRealAddress() {
+        InetSocketAddress proxied = this.proxiedAddress;
+        return proxied == null ? this.address : proxied;
     }
 
     public int getMtu() {
@@ -160,7 +163,7 @@ public abstract class RakNetSession implements SessionConnection<ByteBuf> {
     }
 
     public int getProtocolVersion() {
-        return protocolVersion;
+        return this.protocolVersion;
     }
 
     public long getPing() {
@@ -217,34 +220,38 @@ public abstract class RakNetSession implements SessionConnection<ByteBuf> {
         return result;
     }
 
-    void onDatagram(ByteBuf buffer) {
-        if (this.isClosed()) {
-            return;
-        }
-
-        this.touch();
-
-        byte potentialFlags = buffer.readByte();
-
-        boolean rakNetDatagram = (potentialFlags & FLAG_VALID) != 0;
-
-        // Potential RakNet datagram
-        if (rakNetDatagram) {
-            // Block RakNet datagrams if we haven't initialized the session yet.
-            if (this.state.ordinal() >= RakNetState.INITIALIZED.ordinal()) {
-                if ((potentialFlags & FLAG_ACK) != 0) {
-                    this.onAcknowledge(buffer, this.incomingAcks);
-                } else if ((potentialFlags & FLAG_NACK) != 0) {
-                    this.onAcknowledge(buffer, this.incomingNaks);
-                } else {
-                    buffer.readerIndex(0);
-                    this.onRakNetDatagram(buffer);
-                }
+    public void onDatagram(ByteBuf buffer) {
+        try {
+            if (this.isClosed()) {
+                return;
             }
-        } else {
-            // Direct packet
-            buffer.readerIndex(0);
-            this.onPacketInternal(buffer);
+            this.touch();
+
+            byte potentialFlags = buffer.readByte();
+            boolean rakNetDatagram = (potentialFlags & FLAG_VALID) != 0;
+            if (!rakNetDatagram) {
+                // Received non-datagram packet
+                buffer.readerIndex(0);
+                this.onPacketInternal(buffer);
+                return;
+            }
+
+            if (this.state == null || this.state.ordinal() < RakNetState.INITIALIZED.ordinal()) {
+                // Block RakNet datagrams if we haven't initialized the session yet.
+                return;
+            }
+
+            // Check if we have received acknowledge datagram
+            if ((potentialFlags & FLAG_ACK) != 0) {
+                this.onAcknowledge(buffer, this.incomingAcks, false);
+            } else if((potentialFlags & FLAG_NACK) != 0) {
+                this.onAcknowledge(buffer, this.incomingNaks, true);
+            } else {
+                buffer.readerIndex(0);
+                this.onRakNetDatagram(buffer);
+            }
+        } finally {
+            buffer.release();
         }
     }
 
@@ -293,6 +300,10 @@ public abstract class RakNetSession implements SessionConnection<ByteBuf> {
     private void onRakNetDatagram(ByteBuf buffer) {
         if (this.state == null || RakNetState.INITIALIZED.compareTo(this.state) > 0) {
             return;
+        }
+
+        if (this.getRakNet().getMetrics() != null) {
+            this.getRakNet().getMetrics().rakDatagramsIn(1);
         }
 
         RakNetDatagram datagram = new RakNetDatagram(System.currentTimeMillis());
@@ -431,140 +442,187 @@ public abstract class RakNetSession implements SessionConnection<ByteBuf> {
             this.sendConnectedPing(curTime);
         }
 
-        // Incoming queues
+        this.handleIncomingAcknowledge(curTime, this.incomingAcks, false);
+        this.handleIncomingAcknowledge(curTime, this.incomingNaks, true);
 
-        if (!this.incomingAcks.isEmpty()) {
-
-            IntRange range;
-            while ((range = this.incomingAcks.poll()) != null) {
-                for (int i = range.start; i <= range.end; i++) {
-                    RakNetDatagram datagram = this.sentDatagrams.remove(i);
-                    if (datagram != null) {
-                        datagram.release();
-                        this.unackedBytes -= datagram.getSize();
-                        this.slidingWindow.onAck(curTime - datagram.sendTime, datagram.sequenceIndex, this.datagramReadIndex);
-                    }
-                }
-            }
-        }
-
-        if (!this.incomingNaks.isEmpty()) {
-            this.slidingWindow.onNak();
-            IntRange range;
-            while ((range = this.incomingNaks.poll()) != null) {
-                for (int i = range.start; i <= range.end; i++) {
-                    RakNetDatagram datagram = this.sentDatagrams.remove(i);
-                    if (datagram != null) {
-                        if (log.isTraceEnabled()) {
-                            log.trace("NAK'ed datagram {} from {}", datagram.sequenceIndex, this.address);
-                        }
-                        this.sendDatagram(datagram, curTime);
-                    }
-                }
-            }
-        }
-
-        // Outgoing queues
-
+        // Send known outgoing acknowledge packets.
+        RakMetrics metrics = this.getRakNet().getMetrics();
         final int mtu = this.adjustedMtu - RAKNET_DATAGRAM_HEADER_SIZE;
-
+        int writtenNacks = 0;
         while (!this.outgoingNaks.isEmpty()) {
             ByteBuf buffer = this.allocateBuffer(mtu);
             buffer.writeByte(FLAG_VALID | FLAG_NACK);
-            RakNetUtils.writeIntRanges(buffer, this.outgoingNaks, mtu - 1);
-
+            writtenNacks += RakNetUtils.writeIntRanges(buffer, this.outgoingNaks, mtu - 1);
             this.sendDirect(buffer);
         }
 
+        if (metrics != null) {
+            metrics.nackOut(writtenNacks);
+        }
+
         if (this.slidingWindow.shouldSendAcks(curTime)) {
+            int writtenAcks = 0;
             while (!this.outgoingAcks.isEmpty()) {
                 ByteBuf buffer = this.allocateBuffer(mtu);
                 buffer.writeByte(FLAG_VALID | FLAG_ACK);
-                RakNetUtils.writeIntRanges(buffer, this.outgoingAcks, mtu - 1);
-
+                writtenAcks += RakNetUtils.writeIntRanges(buffer, this.outgoingAcks, mtu - 1);
                 this.sendDirect(buffer);
-
                 this.slidingWindow.onSendAck();
+            }
+
+            if (metrics != null) {
+                metrics.ackOut(writtenAcks);
             }
         }
 
-        int transmissionBandwidth;
-        // Send packets that are stale first
-
-        if (!this.sentDatagrams.isEmpty()) {
-            transmissionBandwidth = this.slidingWindow.getRetransmissionBandwidth(this.unackedBytes);
-            boolean hasResent = false;
-
-            for (RakNetDatagram datagram : this.sentDatagrams.values()) {
-                if (datagram.nextSend <= curTime) {
-                    int size = datagram.getSize();
-                    if (transmissionBandwidth < size) {
-                        break;
-                    }
-                    transmissionBandwidth -= size;
-
-                    if (!hasResent) {
-                        hasResent = true;
-                    }
-                    if (log.isTraceEnabled()) {
-                        log.trace("Stale datagram {} from {}", datagram.sequenceIndex,
-                                this.address);
-                    }
-                    this.sendDatagram(datagram, curTime);
-                }
-            }
-
-            if (hasResent) {
-                this.slidingWindow.onResend(curTime);
-            }
+        // Send packets that are stale first. This function returns whether or not to continue
+        // send the rest of the datagrams, as it might close the client due to too many stale packets
+        if (!this.sendStaleDatagrams(curTime)) {
+            return;
         }
 
         // Now send usual packets
-        if (!this.outgoingPackets.isEmpty()) {
-            transmissionBandwidth = this.slidingWindow.getTransmissionBandwidth(this.unackedBytes);
-            RakNetDatagram datagram = new RakNetDatagram(curTime);
-            EncapsulatedPacket packet;
+        this.sendDatagrams(curTime);
+        // Finally flush channel
+        this.channel.flush();
+    }
 
-            while ((packet = this.outgoingPackets.peek()) != null) {
-                int size = packet.getSize();
+    private void handleIncomingAcknowledge(long curTime, Queue<IntRange> queue, boolean nack) {
+        if (queue.isEmpty()) {
+            return;
+        }
+
+        if (nack) {
+            this.slidingWindow.onNak();
+        }
+
+        IntRange range;
+        while ((range = queue.poll()) != null) {
+            for (int i = range.start; i <= range.end; i++) {
+                RakNetDatagram datagram = this.sentDatagrams.remove(i);
+                if (datagram != null) {
+                    if (nack) {
+                        this.onIncomingNack(datagram, curTime);
+                    } else {
+                        this.onIncomingAck(datagram, curTime);
+                    }
+                }
+            }
+        }
+    }
+
+    private void onIncomingAck(RakNetDatagram datagram, long curTime) {
+        try {
+            this.unackedBytes -= datagram.getSize();
+            this.slidingWindow.onAck(curTime - datagram.sendTime, datagram.sequenceIndex, this.datagramReadIndex);
+        } finally {
+            datagram.release();
+        }
+    }
+
+    private void onIncomingNack(RakNetDatagram datagram, long curTime) {
+        if (log.isTraceEnabled()) {
+            log.trace("NAK'ed datagram {} from {}", datagram.sequenceIndex, this.address);
+        }
+        this.sendDatagram(datagram, curTime);
+    }
+
+    private boolean sendStaleDatagrams(long curTime) {
+        if (this.sentDatagrams.isEmpty()) {
+            return true;
+        }
+
+        boolean hasResent = false;
+        int resendCount = 0;
+        int transmissionBandwidth = this.slidingWindow.getRetransmissionBandwidth(this.unackedBytes);
+
+        for (RakNetDatagram datagram : this.sentDatagrams.values()) {
+            if (datagram.getNextSend() <= curTime) {
+                int size = datagram.getSize();
                 if (transmissionBandwidth < size) {
                     break;
                 }
                 transmissionBandwidth -= size;
 
-                this.outgoingPackets.remove();
-
-                if (!datagram.tryAddPacket(packet, this.adjustedMtu)) {
-                    // Send full datagram
-                    this.sendDatagram(datagram, curTime);
-
-                    datagram = new RakNetDatagram(curTime);
-
-                    Preconditions.checkArgument(datagram.tryAddPacket(packet, this.adjustedMtu),
-                            "Packet too large to fit in MTU (size: %s, MTU: %s)",
-                            packet.getSize(), this.adjustedMtu);
+                if (!hasResent) {
+                    hasResent = true;
                 }
-            }
-
-            if (!datagram.packets.isEmpty()) {
+                resendCount++;
                 this.sendDatagram(datagram, curTime);
             }
         }
-        this.channel.flush();
+
+        if (resendCount > MAXIMUM_STALE_DATAGRAMS) {
+            this.close(DisconnectReason.TIMED_OUT);
+            if (log.isTraceEnabled()) {
+                log.trace("Too many Slate datagrams for {}. Disconnected", this.address);
+            }
+            return false;
+        }
+
+        if (hasResent) {
+            this.slidingWindow.onResend(curTime);
+        }
+
+        RakMetrics metrics = this.getRakNet().getMetrics();
+        if (metrics != null) {
+            metrics.rakStaleDatagrams(resendCount);
+        }
+
+        return true;
+    }
+
+    private void sendDatagrams(long curTime) {
+        if (this.outgoingPackets.isEmpty()) {
+            return;
+        }
+
+        int transmissionBandwidth = this.slidingWindow.getTransmissionBandwidth(this.unackedBytes);
+        RakNetDatagram datagram = new RakNetDatagram(curTime);
+        EncapsulatedPacket packet;
+
+        while ((packet = this.outgoingPackets.peek()) != null) {
+            int size = packet.getSize();
+            if (transmissionBandwidth < size) {
+                break;
+            }
+
+            transmissionBandwidth -= size;
+            this.outgoingPackets.remove();
+
+            // Send full datagram
+            if (!datagram.tryAddPacket(packet, this.adjustedMtu)) {
+                this.sendDatagram(datagram, curTime);
+
+                datagram = new RakNetDatagram(curTime);
+                if (!datagram.tryAddPacket(packet, this.adjustedMtu)) {
+                    throw new IllegalArgumentException("Packet too large to fit in MTU (size: " + packet.getSize() + ", MTU: " + this.adjustedMtu +")");
+                }
+            }
+        }
+
+        if (!datagram.getPackets().isEmpty()) {
+            this.sendDatagram(datagram, curTime);
+        }
     }
 
     @Override
     public void disconnect() {
-        disconnect(DisconnectReason.DISCONNECTED);
+        this.disconnect(DisconnectReason.DISCONNECTED);
     }
 
     @Override
     public void disconnect(DisconnectReason reason) {
-        if (this.isClosed()) {
-            return;
+        if (!this.isClosed()) {
+            this.eventLoop.execute(() -> this.disconnect0(reason));
         }
-        this.sendDisconnectionNotification();
-        this.close(reason);
+    }
+
+    private void disconnect0(DisconnectReason reason) {
+        if (!this.isClosed()) {
+            this.sendDisconnectionNotification();
+            this.close0(reason);
+        }
     }
 
     @Override
@@ -574,25 +632,24 @@ public abstract class RakNetSession implements SessionConnection<ByteBuf> {
 
     @Override
     public void close(DisconnectReason reason) {
-        if (!closedUpdater.compareAndSet(this, 0, 1)) {
-            return;
-        }
-        if (this.eventLoop.inEventLoop()) {
-            this.close0(reason);
-        } else {
-            this.eventLoop.execute(() -> close0(reason));
+        if (!this.isClosed()) {
+            this.eventLoop.execute(() -> this.close0(reason));
         }
     }
 
     private void close0(DisconnectReason reason) {
+        if (this.isClosed()) {
+            return;
+        }
+
+        this.closed = true;
         this.state = RakNetState.UNCONNECTED;
         this.onClose();
         if (log.isTraceEnabled()) {
-            log.trace("RakNet Session ({} => {}) closed: {}", this.getRakNet().bindAddress, this.address, reason);
+            log.trace("RakNet Session ({} => {}) closed: {}", this.getRakNet().getBindAddress(), this.address, reason);
         }
 
         this.deinitialize();
-
         if (this.listener != null) {
             this.listener.onDisconnect(reason);
         }
@@ -633,7 +690,7 @@ public abstract class RakNetSession implements SessionConnection<ByteBuf> {
 
     private void send0(ByteBuf buf, RakNetPriority priority, RakNetReliability reliability, @Nonnegative int orderingChannel) {
         try {
-            if (isClosed() || state == null || state.ordinal() < RakNetState.INITIALIZED.ordinal()) {
+            if (this.isClosed() || state == null || state.ordinal() < RakNetState.INITIALIZED.ordinal()) {
                 // Session is not ready for RakNet datagrams.
                 return;
             }
@@ -747,6 +804,10 @@ public abstract class RakNetSession implements SessionConnection<ByteBuf> {
 
     private void sendDatagram(RakNetDatagram datagram, long time) {
         Preconditions.checkArgument(!datagram.packets.isEmpty(), "RakNetDatagram with no packets");
+        if (this.getRakNet().getMetrics() != null) {
+            this.getRakNet().getMetrics().rakDatagramsOut(1);
+        }
+
         try {
             int oldIndex = datagram.sequenceIndex;
             datagram.sequenceIndex = this.datagramWriteIndex++;
@@ -788,12 +849,11 @@ public abstract class RakNetSession implements SessionConnection<ByteBuf> {
     }
 
     /*
-        Packet Handlers
+     * Packet Handlers
      */
 
-    private void onAcknowledge(ByteBuf buffer, Queue<IntRange> queue) {
+    private void onAcknowledge(ByteBuf buffer, Queue<IntRange> queue, boolean nack) {
         this.checkForClosed();
-
         int size = buffer.readUnsignedShort();
         for (int i = 0; i < size; i++) {
             boolean singleton = buffer.readBoolean();
@@ -810,17 +870,24 @@ public abstract class RakNetSession implements SessionConnection<ByteBuf> {
             }
             queue.offer(new IntRange(start, end));
         }
+
+        RakMetrics metrics = this.getRakNet().getMetrics();
+        if (metrics != null) {
+            if (nack) {
+                metrics.nackIn(size);
+            } else {
+                metrics.ackIn(size);
+            }
+        }
     }
 
     private void onConnectedPing(ByteBuf buffer) {
         long pingTime = buffer.readLong();
-
         this.sendConnectedPong(pingTime);
     }
 
     private void onConnectedPong(ByteBuf buffer) {
         long pingTime = buffer.readLong();
-
         if (this.currentPingTime == pingTime) {
             this.lastPingTime = this.currentPingTime;
             this.lastPongTime = System.currentTimeMillis();
@@ -837,37 +904,29 @@ public abstract class RakNetSession implements SessionConnection<ByteBuf> {
 
     private void sendConnectedPing(long pingTime) {
         ByteBuf buffer = this.allocateBuffer(9);
-
         buffer.writeByte(ID_CONNECTED_PING);
         buffer.writeLong(pingTime);
-
         this.send(buffer, RakNetPriority.IMMEDIATE, RakNetReliability.RELIABLE);
-
         this.currentPingTime = pingTime;
     }
 
     private void sendConnectedPong(long pingTime) {
         ByteBuf buffer = this.allocateBuffer(17);
-
         buffer.writeByte(ID_CONNECTED_PONG);
         buffer.writeLong(pingTime);
         buffer.writeLong(System.currentTimeMillis());
-
         this.send(buffer, RakNetPriority.IMMEDIATE, RakNetReliability.RELIABLE);
     }
 
     private void sendDisconnectionNotification() {
         ByteBuf buffer = this.allocateBuffer(1);
-
         buffer.writeByte(ID_DISCONNECTION_NOTIFICATION);
-
         this.send(buffer, RakNetPriority.IMMEDIATE, RakNetReliability.RELIABLE_ORDERED);
     }
 
     private void sendDetectLostConnection() {
         ByteBuf buffer = this.allocateBuffer(1);
         buffer.writeByte(ID_DETECT_LOST_CONNECTION);
-
         this.send(buffer, RakNetPriority.IMMEDIATE);
     }
 
@@ -898,7 +957,7 @@ public abstract class RakNetSession implements SessionConnection<ByteBuf> {
     }
 
     public boolean isClosed() {
-        return this.closed != 0;
+        return this.closed;
     }
 
     public abstract RakNet getRakNet();
