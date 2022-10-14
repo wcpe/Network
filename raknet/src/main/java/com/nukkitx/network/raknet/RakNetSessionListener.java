@@ -10,6 +10,9 @@ public interface RakNetSessionListener {
 
     void onSessionChangeState(RakNetState state);
 
+    default void onPreDisconnect(DisconnectReason reason) {
+    }
+
     void onDisconnect(DisconnectReason reason);
 
     void onEncapsulated(EncapsulatedPacket packet);

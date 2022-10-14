@@ -641,6 +641,10 @@ public abstract class RakNetSession implements SessionConnection<ByteBuf> {
             return;
         }
 
+        if (this.listener != null) {
+            this.listener.onPreDisconnect(reason);
+        }
+
         this.closed = true;
         this.state = RakNetState.UNCONNECTED;
         this.onClose();
