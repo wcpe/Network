@@ -42,7 +42,7 @@ public class RakNetConstants {
      * How many Stale Datagrams a {@link RakNetSession} can hold before been
      * forcefully closed
      */
-    public static final int MAXIMUM_STALE_DATAGRAMS = 2000;
+    public static final int MAXIMUM_STALE_DATAGRAMS = 1024;
 
     /*
         Flags
