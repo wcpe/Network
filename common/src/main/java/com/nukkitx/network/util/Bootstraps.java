@@ -58,6 +58,11 @@ public final class Bootstraps {
         setupAbstractBootstrap(bootstrap);
     }
 
+    public static void setupClientBootstrap(Bootstrap bootstrap) {
+        Class<? extends Channel> channel = getChannelType().getSocketChannel();
+        bootstrap.channel(channel);
+    }
+
     public static void setupServerBootstrap(ServerBootstrap bootstrap) {
         Class<? extends ServerSocketChannel> channel = getChannelType().getServerSocketChannel();
         bootstrap.channel(channel);

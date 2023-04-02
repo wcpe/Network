@@ -4,6 +4,7 @@ import com.nukkitx.network.util.Bootstraps;
 import com.nukkitx.network.util.Preconditions;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.ByteBufAllocator;
+import io.netty.channel.ChannelException;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.EventLoop;
 import io.netty.channel.EventLoopGroup;
@@ -39,6 +40,10 @@ public abstract class RakNet implements AutoCloseable {
         this.bootstrap = new Bootstrap().option(ChannelOption.ALLOCATOR, ByteBufAllocator.DEFAULT);
         this.bootstrap.group(eventLoopGroup);
         Bootstraps.setupBootstrap(this.bootstrap, true);
+        try {
+            this.bootstrap.option(ChannelOption.IP_TOS, 0x10 | 0x8); // IPTOS_LOWDELAY | IPTOS_THROUGHPUT
+        } catch (ChannelException ignored) {
+        }
         try {
             this.bootstrap.option(RakNetChannelOption.IP_DONT_FRAG, 2 /* IP_PMTUDISC_DO */);
         } catch (Throwable ignored) {
