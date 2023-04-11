@@ -1,9 +1,15 @@
 package com.nukkitx.network.raknet;
 
+import io.netty.util.internal.logging.InternalLogger;
+import io.netty.util.internal.logging.InternalLoggerFactory;
+
 import static com.nukkitx.network.raknet.RakNetConstants.*;
 
 public class RakNetSlidingWindow {
+    private static final InternalLogger log = InternalLoggerFactory.getInstance(RakNetSlidingWindow.class);
+
     private final int mtu;
+    private final int adjustedMtu;
     private double cwnd;
     private double ssThresh;
     private double estimatedRTT = -1;
@@ -12,17 +18,22 @@ public class RakNetSlidingWindow {
     private long oldestUnsentAck;
     private long nextCongestionControlBlock;
     private boolean backoffThisBlock;
+    private boolean isContinuousSend;
+    private int expectedNextSequenceNumber;
+    private int nextSequenceNumber;
 
-    public RakNetSlidingWindow(int mtu) {
+    public RakNetSlidingWindow(int mtu, int adjustedMtu) {
         this.mtu = mtu;
         this.cwnd = mtu;
+        this.adjustedMtu = adjustedMtu;
     }
 
     public int getRetransmissionBandwidth(int unAckedBytes) {
         return unAckedBytes;
     }
 
-    public int getTransmissionBandwidth(int unAckedBytes) {
+    public int getTransmissionBandwidth(int unAckedBytes, boolean isContinuousSend) {
+        this.isContinuousSend = isContinuousSend;
         if (unAckedBytes <= this.cwnd) {
             return (int) (this.cwnd - unAckedBytes);
         } else {
@@ -30,33 +41,57 @@ public class RakNetSlidingWindow {
         }
     }
 
-    public void onPacketReceived(long curTime) {
+    public int onPacketReceived(long curTime, int sequenceNumber) {
         if (this.oldestUnsentAck == 0) {
             this.oldestUnsentAck = curTime;
         }
+
+        int skippedMessageCount = 0;
+        if (sequenceNumber == this.expectedNextSequenceNumber) {
+            this.expectedNextSequenceNumber = sequenceNumber + 1 & 0xFFFFFF;
+        } else if (sequenceNumber > this.expectedNextSequenceNumber || this.expectedNextSequenceNumber - sequenceNumber > 0x7FFFFF) {
+            skippedMessageCount = sequenceNumber - this.expectedNextSequenceNumber & 0xFFFFFF;
+            if (skippedMessageCount > 1000) {
+                if (skippedMessageCount > 50000) {
+                    log.debug("Too many stale data: {}", skippedMessageCount);
+                    return -1;
+                }
+                skippedMessageCount = 1000;
+            }
+            this.expectedNextSequenceNumber = sequenceNumber + 1 & 0xFFFFFF;
+        }
+        return skippedMessageCount;
     }
 
-    public void onResend(long curSequenceIndex) {
-        if (!this.backoffThisBlock && this.cwnd > this.mtu * 2) {
+    public void onResend() {
+        if (this.isContinuousSend && !this.backoffThisBlock && this.cwnd > this.adjustedMtu * 2) {
             this.ssThresh = this.cwnd / 2D;
 
-            if (this.ssThresh < this.mtu) {
-                this.ssThresh = this.mtu;
+            if (this.ssThresh < this.adjustedMtu) {
+                this.ssThresh = this.adjustedMtu;
             }
-            this.cwnd = this.mtu;
+            this.cwnd = this.adjustedMtu;
 
-            this.nextCongestionControlBlock = curSequenceIndex;
+            this.nextCongestionControlBlock = this.nextSequenceNumber;
             this.backoffThisBlock = true;
         }
     }
 
     public void onNak() {
-        if (!this.backoffThisBlock) {
+        if (this.isContinuousSend && !this.backoffThisBlock) {
             this.ssThresh = this.cwnd / 2D;
+            this.nextCongestionControlBlock = this.nextSequenceNumber;
+            this.backoffThisBlock = true;
         }
     }
 
-    public void onAck(long rtt, long sequenceIndex, long curSequenceIndex) {
+    public int getAndIncrementNextSequenceNumber() {
+        int n = this.nextSequenceNumber;
+        this.nextSequenceNumber = this.nextSequenceNumber + 1 & 0xFFFFFF;
+        return n;
+    }
+
+    public void onAck(long rtt, long sequenceIndex, boolean isContinuousSend) {
         this.lastRTT = rtt;
 
         if (this.estimatedRTT == -1) {
@@ -69,11 +104,16 @@ public class RakNetSlidingWindow {
             this.deviationRTT += d * (Math.abs(difference) - this.deviationRTT);
         }
 
-        boolean isNewCongestionControlPeriod = sequenceIndex > this.nextCongestionControlBlock;
+        this.isContinuousSend = isContinuousSend;
+        if (!isContinuousSend) {
+            return;
+        }
+
+        boolean isNewCongestionControlPeriod = sequenceIndex > this.nextCongestionControlBlock || this.nextCongestionControlBlock - sequenceIndex > 0x7FFFFF;
 
         if (isNewCongestionControlPeriod) {
             this.backoffThisBlock = false;
-            this.nextCongestionControlBlock = curSequenceIndex;
+            this.nextCongestionControlBlock = this.nextSequenceNumber;
         }
 
         if (this.isInSlowStart()) {
@@ -82,9 +122,10 @@ public class RakNetSlidingWindow {
             if (this.cwnd > this.ssThresh && this.ssThresh != 0) {
                 this.cwnd = this.ssThresh + this.mtu * this.mtu / this.cwnd;
             }
-        } else if (isNewCongestionControlPeriod) {
+        } else {
             this.cwnd += this.mtu * this.mtu / this.cwnd;
         }
+        this.cwnd = this.cwnd > Integer.MAX_VALUE ? Integer.MAX_VALUE : this.cwnd;
     }
 
     public boolean isInSlowStart() {

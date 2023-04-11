@@ -37,7 +37,9 @@ public abstract class RakNet implements AutoCloseable {
     protected RakMetrics metrics;
 
     RakNet(EventLoopGroup eventLoopGroup) {
-        this.bootstrap = new Bootstrap().option(ChannelOption.ALLOCATOR, ByteBufAllocator.DEFAULT);
+        this.bootstrap = new Bootstrap().option(ChannelOption.ALLOCATOR, ByteBufAllocator.DEFAULT)
+                .option(ChannelOption.SO_RCVBUF, 2 * 1024 * 1024)
+                .option(ChannelOption.SO_SNDBUF, 2 * 1024 * 1024);
         this.bootstrap.group(eventLoopGroup);
         Bootstraps.setupBootstrap(this.bootstrap, true);
         try {

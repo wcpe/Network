@@ -8,12 +8,15 @@ import io.netty.channel.EventLoop;
 
 import javax.annotation.ParametersAreNonnullByDefault;
 import java.net.InetSocketAddress;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 
 import static com.nukkitx.network.raknet.RakNetConstants.*;
 
 @ParametersAreNonnullByDefault
 public class RakNetServerSession extends RakNetSession {
     private final RakNetServer rakNet;
+    private ScheduledFuture<?> tickFuture;
 
     RakNetServerSession(RakNetServer rakNet, InetSocketAddress remoteAddress, Channel channel, EventLoop eventLoop, int mtu,
                         int protocolVersion) {
@@ -40,6 +43,9 @@ public class RakNetServerSession extends RakNetSession {
 
     @Override
     protected void onClose() {
+        if (this.tickFuture != null) {
+            this.tickFuture.cancel(false);
+        }
         if (!this.rakNet.sessionsByAddress.remove(this.address, this)) {
             throw new IllegalStateException("Session was not found in session map");
         }
@@ -48,6 +54,15 @@ public class RakNetServerSession extends RakNetSession {
     @Override
     public RakNet getRakNet() {
         return this.rakNet;
+    }
+
+    private void onTick() {
+        long curTime = System.currentTimeMillis();
+        try {
+            this.onTick(curTime);
+        } catch (Exception e) {
+            log.error("RakNet server tick exception", e);
+        }
     }
 
     private void onOpenConnectionRequest2(ByteBuf buffer) {
@@ -97,6 +112,8 @@ public class RakNetServerSession extends RakNetSession {
     }
 
     void sendOpenConnectionReply1() {
+        this.tickFuture = this.eventLoop.scheduleAtFixedRate(this::onTick, 0, 10, TimeUnit.MILLISECONDS);
+
         ByteBuf buffer = this.allocateBuffer(28);
 
         buffer.writeByte(ID_OPEN_CONNECTION_REPLY_1);

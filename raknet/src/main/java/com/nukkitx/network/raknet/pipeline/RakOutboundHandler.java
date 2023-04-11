@@ -1,5 +1,6 @@
 package com.nukkitx.network.raknet.pipeline;
 
+import com.nukkitx.network.raknet.RakMetrics;
 import com.nukkitx.network.raknet.RakNet;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
@@ -22,9 +23,10 @@ public class RakOutboundHandler extends ChannelOutboundHandlerAdapter {
             return;
         }
 
-        ByteBuf buffer = ((DatagramPacket) msg).content();
-        if (this.rakNet.getMetrics() != null) {
-            this.rakNet.getMetrics().bytesOut(buffer.readableBytes());
+        RakMetrics metrics = this.rakNet.getMetrics();
+        if (metrics != null) {
+            ByteBuf buffer = ((DatagramPacket) msg).content();
+            metrics.bytesOut(buffer.readableBytes());
         }
         super.write(ctx, msg, promise);
     }

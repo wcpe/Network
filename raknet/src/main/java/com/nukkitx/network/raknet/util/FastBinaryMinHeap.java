@@ -1,13 +1,14 @@
 package com.nukkitx.network.raknet.util;
 
+import com.nukkitx.network.raknet.EncapsulatedPacket;
 import com.nukkitx.network.raknet.RakNetUtils;
 
 import java.util.Arrays;
 import java.util.NoSuchElementException;
 import java.util.Objects;
 
-public class FastBinaryMinHeap<E> {
-    private Object[] heap;
+public class FastBinaryMinHeap {
+    private HeapElement[] heap;
     public long[] weights;
     private int size;
 
@@ -16,7 +17,7 @@ public class FastBinaryMinHeap<E> {
     }
 
     public FastBinaryMinHeap(int initialCapacity) {
-        this.heap = new Object[++initialCapacity];
+        this.heap = new HeapElement[++initialCapacity];
         this.weights = new long[initialCapacity];
         Arrays.fill(this.weights, Long.MAX_VALUE); // infimum
         this.weights[0] = Long.MIN_VALUE; // supremum
@@ -25,7 +26,7 @@ public class FastBinaryMinHeap<E> {
     private void resize(int capacity) {
         int adjustedSize = this.size + 1;
         int copyLength = Math.min(this.heap.length, adjustedSize);
-        Object[] newHeap = new Object[capacity];
+        HeapElement[] newHeap = new HeapElement[capacity];
         long[] newWeights = new long[capacity];
         System.arraycopy(this.heap, 0, newHeap, 0, copyLength);
         System.arraycopy(this.weights, 0, newWeights, 0, copyLength);
@@ -36,13 +37,13 @@ public class FastBinaryMinHeap<E> {
         this.weights = newWeights;
     }
 
-    public void insert(long weight, E element) {
+    public void insert(long weight, EncapsulatedPacket element) {
         Objects.requireNonNull(element, "element");
         this.ensureCapacity(this.size + 1);
-        this.insert0(weight, element);
+        this.insert0(weight, new EncapsulatedPacket[]{element});
     }
 
-    private void insert0(long weight, E element) {
+    private void insert0(long weight, EncapsulatedPacket[] element) {
         int hole = ++this.size;
         int pred = hole >> 1;
         long predWeight = this.weights[pred];
@@ -56,40 +57,16 @@ public class FastBinaryMinHeap<E> {
         }
 
         this.weights[hole] = weight;
-        this.heap[hole] = element;
+        this.heap[hole] = new HeapElement(element);
     }
 
-    public void insertSeries(long weight, E[] elements) {
+    public void insertSeries(long weight, EncapsulatedPacket[] elements) {
         Objects.requireNonNull(elements, "elements");
         if (elements.length == 0) return;
 
         this.ensureCapacity(this.size + elements.length);
 
-        // Try and optimize insertion.
-        boolean optimized = this.size == 0;
-        if (!optimized) {
-            optimized = true;
-            for (int parentIdx = 0, currentIdx = this.size; parentIdx < currentIdx; parentIdx++) {
-                if (weight < this.weights[parentIdx]) {
-                    optimized = false;
-                    break;
-                }
-            }
-        }
-
-        if (optimized) {
-            // Parents are all less than series weight so we can directly insert.
-            for (E element : elements) {
-                Objects.requireNonNull(element, "element");
-                this.heap[++this.size] = element;
-                this.weights[this.size] = weight;
-            }
-        } else {
-            for (E element : elements) {
-                Objects.requireNonNull(element, "element");
-                this.insert0(weight, element);
-            }
-        }
+        this.insert0(weight, elements);
     }
 
     private void ensureCapacity(int size) {
@@ -99,15 +76,17 @@ public class FastBinaryMinHeap<E> {
         }
     }
 
-    @SuppressWarnings("unchecked")
-    public E peek() {
-        return (E) this.heap[1];
+    public EncapsulatedPacket peek() {
+        HeapElement e = this.heap[1];
+        if (e != null) {
+            return e.peek();
+        }
+        return null;
     }
 
-    @SuppressWarnings("unchecked")
-    public E poll() {
+    public EncapsulatedPacket poll() {
         if (this.size > 0) {
-            E e = (E) this.heap[1];
+            EncapsulatedPacket e = this.peek();
             this.remove();
             return e;
         }
@@ -117,6 +96,9 @@ public class FastBinaryMinHeap<E> {
     public void remove() {
         if (this.size == 0) {
             throw new NoSuchElementException("Heap is empty");
+        }
+        if (this.heap[1].remove()) {
+            return;
         }
         int hole = 1;
         int succ = 2;
@@ -167,5 +149,22 @@ public class FastBinaryMinHeap<E> {
 
     public int size() {
         return this.size;
+    }
+
+    private static class HeapElement {
+        private final EncapsulatedPacket[] packets;
+        private int index;
+
+        public HeapElement(EncapsulatedPacket[] packets) {
+            this.packets = packets;
+        }
+
+        public EncapsulatedPacket peek() {
+            return this.packets[this.index];
+        }
+
+        public boolean remove() {
+            return ++this.index < this.packets.length;
+        }
     }
 }

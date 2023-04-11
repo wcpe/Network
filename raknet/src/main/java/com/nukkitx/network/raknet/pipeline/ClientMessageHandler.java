@@ -1,5 +1,6 @@
 package com.nukkitx.network.raknet.pipeline;
 
+import com.nukkitx.network.raknet.RakMetrics;
 import com.nukkitx.network.raknet.RakNetClient;
 import com.nukkitx.network.raknet.RakNetClientSession;
 import com.nukkitx.network.raknet.RakNetUtils;
@@ -26,8 +27,9 @@ public class ClientMessageHandler extends SimpleChannelInboundHandler<DatagramPa
             return;
         }
 
-        if (this.client.getMetrics() != null) {
-            this.client.getMetrics().bytesIn(buffer.readableBytes());
+        RakMetrics metrics = this.client.getMetrics();
+        if (metrics != null) {
+            metrics.bytesIn(buffer.readableBytes());
         }
 
         int packetId = buffer.readUnsignedByte();

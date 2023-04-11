@@ -1,5 +1,6 @@
 package com.nukkitx.network.raknet.pipeline;
 
+import com.nukkitx.network.raknet.RakMetrics;
 import com.nukkitx.network.raknet.RakNetServer;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandler;
@@ -28,8 +29,9 @@ public class ServerMessageHandler extends SimpleChannelInboundHandler<DatagramPa
             return;
         }
 
-        if (this.server.getMetrics() != null) {
-            this.server.getMetrics().bytesIn(buffer.readableBytes());
+        RakMetrics metrics = this.server.getMetrics();
+        if (metrics != null) {
+            metrics.bytesIn(buffer.readableBytes());
         }
         ctx.fireChannelRead(packet.retain());
     }
