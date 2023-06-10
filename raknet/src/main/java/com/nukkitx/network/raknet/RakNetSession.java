@@ -997,7 +997,7 @@ public abstract class RakNetSession implements SessionConnection<ByteBuf> {
     private void sendDisconnectionNotification() {
         ByteBuf buffer = this.allocateBuffer(1);
         buffer.writeByte(ID_DISCONNECTION_NOTIFICATION);
-        this.send(buffer, RakNetPriority.IMMEDIATE, RakNetReliability.RELIABLE_ORDERED);
+        this.send(buffer, RakNetPriority.IMMEDIATE, RakNetReliability.RELIABLE);
     }
 
     private void sendDetectLostConnection() {
